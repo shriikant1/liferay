@@ -1,0 +1,131 @@
+parameters:
+  - name: buildhisc
+    displayName: Build Up Image For Hisc
+    type: boolean
+    default: false
+  - name: cert
+    displayName: Enable SSL by Using Let's Encrypt
+    type: boolean
+    default: false
+  - name: tagimagehisc
+    displayName: Hisc Image Tag
+    type: string
+    default: latest
+  - name: env
+    displayName: ENV Build (dev, test, preprod, prod)
+    type: string
+    default: dev
+
+trigger:
+  - none
+
+name: $(Rev:r).$(parameters.env)
+
+pool:
+  name: 'DevOps-pipeline-vmss-v20'
+
+variables:
+  rgname: $[format('rg-hioaas-{0}', parameters.env)]
+  acrname: $[format('acrhioaas-{0}', parameters.env)]
+  aksname: $[format('aks-hioaas-{0}', parameters.env)]
+  agwname: $[format('agw-hioaas-{0}', parameters.env)]
+  stglogs_name: $[format('stlogshiscliferayhos{0}', parameters.env)]
+  stgliferay_name: $[format('hioaasdevopssthisc{0}', parameters.env)]
+  keyvault_name: $[format('kv-hioaas-{0}', parameters.env)]
+  network_application_gateway: $[format('{0}-hisc-root-cert', parameters.env)]
+  backend_hostname: $[format('{0}.hiop.hitachivantara.com', parameters.env)]
+  shareName: "aksliferayshare"
+  stgclass_name: "azureblob-fuse-premium-hisc"
+
+stages:
+- stage: "Build_and_Push_Image"
+  jobs:
+    - job: Build_up_hisc_ci
+      timeoutInMinutes: 90
+      steps:
+        - script: |
+            echo "Installing dependencies and Docker"
+            sudo apt-get update -y
+            sudo apt-get install -y curl wget python3-pip apt-transport-https gnupg
+            sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+            sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+            sudo apt-get update
+            sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose
+            sudo usermod -aG docker $USER
+            sudo chmod 777 /var/run/docker.sock
+            echo "[INFO] Docker Version"
+            docker --version
+            echo "[INFO] Installing Liferay tools"
+            wget https://raw.githubusercontent.com/jpm4j/jpm4j.installers/master/dist/biz.aQute.jpm.run.jar
+            sudo java -jar biz.aQute.jpm.run.jar init
+            curl -L https://raw.githubusercontent.com/liferay/liferay-blade-cli/master/cli/installers/local | sh
+            export PATH="$PATH:$HOME/jpm/bin"
+            blade gw createDockerfile
+            echo "[INFO] Copying necessary files for Docker"
+            sudo cp devops/Root-CA/$(network_application_gateway).cer build/docker
+            sudo cp configs/common/portal-log4j-ext.xml build/docker
+            sudo cp configs/common/tcp.xml build/docker
+            sudo sh devops/scripts/dockerfile-preprod.sh $(parameters.env)
+            echo "[INFO] Dockerfile built."
+            cd themes/hisc-theme
+            npm install --production
+            blade gw deploy
+            cd ../../modules
+            blade gw deploy
+          displayName: 'Provisioning Liferay Deployment'
+          condition: eq('${{ parameters.buildhisc }}', true)
+
+    - script: |
+        echo "[INFO] Logging in and pushing image to ACR"
+        sudo az login --service-principal -u $(AZURE_CLIENT_ID) -p $(AZURE_SECRET) --tenant $(AZURE_TENANT)
+        docker login '$(acrname).azurecr.io' -u $(AZURE_CLIENT_ID) -p $(AZURE_SECRET)
+        sudo az aks get-credentials --resource-group '$(rgname)' --name '$(aksname)'
+        docker build -t '$(acrname).azurecr.io/hisc-liferay:$(tagimagehisc)' .
+        docker push '$(acrname).azurecr.io/hisc-liferay:$(tagimagehisc)'
+      displayName: 'Push Docker Image to ACR'
+      condition: and(succeeded(), eq('${{ parameters.buildhisc }}', true))
+
+- stage: "Liferay_Deployment_to_AKS"
+  jobs:
+    - job: Deploy_Liferay_to_AKS
+      timeoutInMinutes: 180
+      steps:
+        - script: |
+            echo "Installing Helm, Kubectl, and Azure CLI dependencies"
+            sudo apt-get install -y python3-pip curl
+            sudo pip install ansible
+            sudo curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+            sudo apt install -y kubectl
+            sudo curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+            sudo chmod 700 get_helm.sh
+            sudo ./get_helm.sh
+            sudo kubectl version --client
+          displayName: 'Install Azure CLI, Helm, and Kubectl'
+
+        - script: |
+            echo "Logging into Azure and Kubernetes"
+            sudo az login --service-principal -u $(AZURE_CLIENT_ID) -p $(AZURE_SECRET) --tenant $(AZURE_TENANT)
+            sudo az aks get-credentials --resource-group '$(rgname)' --name '$(aksname)'
+            sudo kubectl create namespace $(parameters.env) || true
+            sudo kubectl create secret generic secrets-store-creds --from-literal clientid=$(AZURE_CLIENT_ID) --from-literal clientsecret=$(AZURE_SECRET) --namespace $(parameters.env) || true
+          displayName: 'Login and Setup AKS'
+
+        - script: |
+            echo "Running Ansible Playbook and Deploying Liferay"
+            sudo ansible-playbook -i devops/hisc-liferay/hosts_az_pipeline devops/hisc-liferay/liferay.yaml -vvv \
+            --extra-vars "environment=$(parameters.env) resource_group_name='$(rgname)' keyvault_name='$(keyvault_name)' acrname='$(acrname)' tagimagename='$(tagimagehisc)'"
+          displayName: 'Deploy Liferay to AKS'
+          condition: and(succeeded(), eq('${{ parameters.cert }}', false))
+
+        - script: |
+            echo "Configuring SSL with Cert Manager"
+            sudo helm repo add jetstack https://charts.jetstack.io
+            sudo helm repo update
+            sudo kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.11.0/cert-manager.crds.yaml
+            sudo helm install cert-manager jetstack/cert-manager --namespace cert-manager --version v1.11.0
+            sudo kubectl apply -f devops/hisc-liferay/clusterissuer.yaml
+            sudo ansible-playbook -i devops/hisc-liferay/hosts_az_pipeline devops/hisc-liferay/liferay.yaml -vvv \
+            --extra-vars "environment=$(parameters.env) resource_group_name='$(rgname)' keyvault_name='$(keyvault_name)' acrname='$(acrname)' tagimagename='$(tagimagehisc)'"
+          displayName: 'Configure SSL and Deploy with Cert-Manager'
+          condition: and(succeeded(), eq('${{ parameters.cert }}', true))
+
